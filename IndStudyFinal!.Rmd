@@ -1,0 +1,365 @@
+---
+title: "Shade"
+author: "Abby Saks"
+date: "2/15/2023"
+output: html_document
+---
+
+---
+title: "Stream Light Modeling"
+author: "Abby Saks"
+date: "2/15/2023"
+output: html_document
+---
+
+# Set-Up
+
+A walk through: <https://psavoy.github.io/StreamLight/articles/2%20Download%20and%20process%20MODIS%20LAI.html>.
+
+```{r setup, include=FALSE}
+#clean out environment
+rm(list = ls())
+#remotes::install_github('psavoy/StreamLight')
+#remotes::install_github('psavoy/StreamLightUtils')
+#install.packages('StreamPULSE')
+#install nhdplusTools
+library(remotes)
+library(nhdplusTools)
+library(StreamPULSE)
+library(StreamLight)
+library(StreamLightUtils)
+library(readr)
+library(tidyverse)
+library(openxlsx)
+library(plyr)
+library(BiocGenerics)
+library(dplyr)
+```
+
+# PART 1
+
+Use StreamPULSE to ID our sites and format them CORRECTLY
+
+```{r}
+NC_sites <- StreamPULSE::query_available_data(region = 'NC')$sites
+my_sites <- NC_sites %>% 
+  dplyr::filter(site %in% c('NHC', 'EllerbeGlenn', 'EllerbeClub')) %>%  
+  dplyr::mutate(startDate = as.character('2021-01-01')) %>% 
+  dplyr::select(Site_ID = site, Lat = latitude, Lon = longitude, startDate) %>% 
+  data.frame()
+```
+
+Create sub-directories
+
+```{r}
+dir.create("/Users/abbysaks/Desktop/data/streamlight")
+light_dir <- '/Users/abbysaks/Desktop/data/streamlight'
+if(!dir.exists(light_dir))
+  dir.create(light_dir)
+# and NLDAS data that we download
+NLDAS_dir <- glue::glue(light_dir, 'NLDAS/')
+if(!dir.exists(NLDAS_dir))
+  dir.create(NLDAS_dir)
+```
+
+Bulk download NLDAS data
+
+```{r}
+NLDAS_DL_bulk(save_dir = NLDAS_dir,
+              site_locs = my_sites,
+              startDate = my_sites$startDate)
+ 
+NLDAS_list <- stringr::str_sub(list.files(NLDAS_dir),
+                                1, -11)
+getwd()
+setwd("/Users/abbysaks/Desktop/")
+getwd()
+
+NLDAS_processed <- StreamLightUtils::NLDAS_proc("/Users/abbysaks/Desktop/",
+                                                 Site_IDs = NLDAS_list)
+saveRDS(NLDAS_processed,
+         'NLDAS_proc.rds')
+```
+
+Create csv that we send to AppEEARS data portal
+
+```{r}
+AppEEARS_sites <- my_sites %>% 
+  dplyr::select(-startDate)
+readr::write_csv(AppEEARS_sites,
+                 "/Users/abbysaks/Desktop/data/streamlight/AppEEARS_sites.csv")
+```
+
+Then go to: <https://appeears.earthdatacloud.nasa.gov/task/point> and make a data request
+
+# PART 2
+
+Unpack the NASA data.
+
+```{r}
+Mod_unpack <- AppEEARS_unpack_QC(zip_dir = "/Users/abbysaks/Desktop/data/streamlight/NLDAS",
+                                 zip_file = 'NHC_EC_MODIS.zip',
+                                 request_sites = NLDAS_list)
+Mod_processed <- AppEEARS_proc(unpacked_LAI = Mod_unpack,
+                               fit_method = 'Gu',
+                               plot = TRUE)
+```
+
+Make driver files
+
+```{r}
+driver_sites <- AppEEARS_sites %>% 
+  dplyr::mutate(epsg_crs = 4326)
+driver_dir <- '/Users/abbysaks/Desktop/data/streamlight/driver/NHC_driver.rds'
+if(!dir.exists(driver_dir))
+  dir.create(driver_dir)
+driver<-make_driver(site_locs = driver_sites,
+            NLDAS_processed = NLDAS_processed,
+            MOD_processed = Mod_processed)
+            write_output = TRUE
+           save_dir = '/Users/abbysaks/Desktop/data/streamlight/driver/NHC_driver.rds'
+head(driver)
+```
+
+## Azimuth
+
+Calculate azimuth for sites. Credit: Nick Marzolf
+
+```{r}
+library(nhdplusTools)
+library(geosphere)
+points <- driver_sites %>% 
+  dplyr::select(Lon, Lat) %>% 
+  as.matrix() %>% 
+  st_multipoint() %>% 
+  st_sfc(crs = 4326) %>% 
+  st_cast('POINT')
+azimuth_df <- data.frame(Site_ID = character(),
+                         azimuth = numeric())
+for(k in 1:nrow(driver_sites)){
+  site <- driver_sites[k,]
+  
+  point <- site %>% 
+    dplyr::select(Lon, Lat) %>% 
+    as.matrix() %>% 
+    st_multipoint() %>% 
+    st_sfc(crs = 4326) %>% 
+    st_cast('POINT')
+  
+  comid <- discover_nhdplus_id(point)
+  
+  flowline <- navigate_nldi(list(featureSource = 'comid',
+                                 featureID = comid),
+                            mode = 'upstreamTributaries',
+                            distance_km = 2)
+  
+  subset <- subset_nhdplus(comids = as.integer(flowline$UT_flowlines$nhdplus_comid[1]),
+                           nhdplus_data = 'download',
+                           flowline_only = TRUE,
+                           return_data = TRUE,
+                           overwrite = TRUE)
+  
+  flow_coords <- st_coordinates(subset$NHDFlowline_Network)
+  
+  azimuth <- bearing(p1 = flow_coords[1,1:2],
+                     p2 = flow_coords[nrow(flow_coords), 1:2])
+  
+  if(azimuth < 0){azimuth = azimuth + 180}
+  
+  azimuth_df <- azimuth_df %>% 
+    add_row(Site_ID = pull(site, Site_ID),
+            azimuth = azimuth)
+}
+azimuth_df
+# Save data
+readr::write_csv(azimuth_df,
+              '/Users/abbysaks/Desktop/data/streamlight/azimuths.csv')
+```
+
+# PART 3
+
+```{r}
+
+params<-read.xlsx("/Users/abbysaks/Desktop/data/streamlight/NHC-ECGS_parameters.xlsx") %>% 
+  dplyr::filter(str_detect(Site_ID, "NHC|Glenn")) %>% 
+  mutate(Site_ID = str_replace_all(Site_ID, "NC_", "")) 
+# Define directories
+save_dir<-"/Users/abbysaks/Desktop/data"
+read_dir<-"/Users/abbysaks/Desktop/data/streamlight/driver/"
+```
+
+Define the function
+
+```{r}
+#Function for batching over multiple sites
+  batch_model <- function(Site, read_dir, save_dir){
+    #Get the model driver
+      driver_file <- readRDS(paste(read_dir, "/", Site, "_driver.rds", sep = ""))
+    #Get model parameters for the site
+      site_p <- params[params[, "Site_ID"] == Site, ]
+    #Run the model
+      modeled <- stream_light(driver_file, 
+        Lat = site_p[, "Lat"], 
+        Lon = site_p[, "Lon"],
+        channel_azimuth = site_p[, "Azimuth"], 
+        bottom_width = site_p[, "Width"], 
+        BH = site_p[, "BH"],
+        BS = site_p[, "BS"], 
+        WL = site_p[, "WL"], 
+        TH = site_p[, "TH"], 
+        overhang = site_p[, "overhang"],
+        overhang_height = site_p[, "overhang_height"], 
+        x_LAD = site_p[, "x"]) %>% 
+        mutate(Site = Site)
+      
+            saveRDS(modeled, paste(save_dir, "/", Site, "_modeled-on-", Sys.Date(), "_predicted.rds",  sep = ""))
+  } 
+  #End batch_model 
+```
+
+Run the function, save output
+
+```{r}
+#Applying the model to all sites
+working_dir<-getwd()
+#Running the model
+lapply(params[, "Site_ID"], 
+  FUN = batch_model, 
+  read_dir = read_dir,
+  save_dir = save_dir) 
+# Merge together the output
+output_filenames <- list.files(save_dir, pattern="*.rds", full.names = TRUE)
+  
+Merged_Data<-lapply(output_filenames, readRDS) %>% 
+  data.table::rbindlist(use.names = TRUE, fill = TRUE)
+  
+#Take a look at the output
+   head(Merged_Data)
+   tail(Merged_Data)
+```
+
+#PART 4: analysis
+
+
+```{r}
+  plot_data<-Merged_Data %>% 
+  dplyr::group_by(Site, jday) %>%
+  dplyr::mutate(PAR_surface_dailyAve = mean(PAR_surface)) %>%
+  dplyr::filter(Site=="EllerbeGlenn" | Site == "NHC" )
+
+combo_plot<- plot_data %>% 
+  ggplot(aes(x=local_time, y=PAR_surface_dailyAve, color = Site)) +
+  geom_point() +
+  theme_classic()
+combo_plot  
+plot_data<-Merged_Data %>% 
+    group_by(Site, jday) %>%
+  summarize(PAR_surface_dailyAve = mean(PAR_surface))
+ggsave("output/comboplot5.jpeg")
+
+ellerbe_data<-Merged_Data %>% 
+  dplyr::filter(Site == "EllerbeGlenn")%>%
+  dplyr::group_by(jday) %>%
+  dplyr::mutate(PAR_surface_dailyAve = mean(PAR_surface))%>%
+  slice(1:17,000)
+
+nhc_data<-Merged_Data%>%
+  dplyr::filter(Site == "NHC")%>%
+  dplyr::group_by(jday) %>%
+  dplyr::mutate(PAR_surface_dailyAve = mean(PAR_surface))%>%
+  distinct()%>%
+  slice(1:17,000)
+
+```
+
+```{r}
+insects<-read.xlsx("/Users/abbysaks/Desktop/data/Summer_2022_Benthic-Invertebrate_Datav3.xlsx")
+
+```
+
+```{r}
+insect_data<-insects %>% 
+  dplyr::group_by(Site) %>%
+  dplyr::filter(Site=="ECGS" | Site == "NHC" ) %>%
+  dplyr::mutate(Order=str_sub(Order, 1, 4))
+
+ellerbe_insects<-insects %>% 
+  dplyr::filter(Site == "ECGS")
+nhc_insects<-insects %>% 
+  dplyr::filter(Site == "NHC")
+
+ggplot(data = insect_data, mapping = aes(x = Site, y = Length_mm, color=Site)) + 
+  geom_boxplot()
+
+ggplot(data = insect_data, mapping = aes(x = Order, color=Site)) + 
+  geom_bar()
+
+ggplot(data = insect_data, mapping = aes(x = Sampling_Date, y = Length_mm, color=Site)) + 
+  geom_boxplot()
+
+```
+##Create spreadsheat with amount of light each site receives 30 days leading up to sample collection
+```{r}
+insects_light<-insect_data %>%
+  dplyr::mutate(Sampling_Date = case_when(
+    Sampling_Date == 44340 ~ 2021144,
+    Sampling_Date == 44341 ~ 2021145, 
+    Sampling_Date == 44378 ~ 2021182,
+    Sampling_Date == 44446 ~ 2021250,
+    Sampling_Date == 44518 ~ 2021322,
+    Sampling_Date == 44574 ~ 2022013,
+    Sampling_Date == 44624 ~ 2022063,
+    Sampling_Date == 44641 ~ 2022100
+  )) %>%
+  mutate(Start_Date = Sampling_Date - 30) %>%
+  dplyr::select("Full-ID_Sample_Number", Site, Sampling_Date, Order, Length_mm, Start_Date)
+
+# Create a new column in insects_light that sums all values of PAR_inc where jday is between Start_Date to Sampling_Date
+insects_results <- insects_light %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(total_light = sum(Merged_Data$PAR_inc[Merged_Data$jday >= Start_Date & Merged_Data$jday <= Sampling_Date]))
+readr::write_csv(insects_results,
+                 "/Users/abbysaks/Desktop/data/insects_results.csv")
+
+```
+
+##Test relationship between length and light a site receives
+```{r}
+
+aggregate(insects_results$Length_mm, list(insects_results$Sampling_Date), FUN=mean) 
+
+insects_results %>%
+  dplyr::group_by(Site, Sampling_Date) %>%
+  dplyr::summarize(mean_length=mean(Length_mm))
+## trying to test if there is a relationship between total_light and length
+wilcox.test(insects_results$total_light, insects_results$Length_mm, paired=TRUE)
+model <- lm(Length_mm ~ total_light, data=insects_results)
+summary(model)
+insects_results$Sampling_Date<-as.character(insects_results$Sampling_Date)
+ggplot(insects_results, aes(x=Sampling_Date, y=Length_mm))+
+                     geom_boxplot()
+
+```
+
+```{r}
+
+library(tidyverse)
+library(ggridges) 
+
+#Make your own palette of colors, if you want 
+pal_sites<-c('#358221', '#BB2E2E', '#726A59')
+names(pal_sites) <- c('NHC', 'ECGS', 'ECNG') 
+
+#create the plot (x could be mass or count)
+plotted<-insect_data %>% #update based on your data
+  ggplot(aes(x=Length_mm, y=Site, fill=Site, color = Site)) + #update based on your data
+  geom_density_ridges(alpha = 0.5) +
+  theme_classic() + 
+  scale_x_continuous(trans = "log10", labels = scales::comma) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  labs(x= "Insect length (mm) (on log scale)", y= "Count")
+
+#view the plot
+print(plotted)
+
+```
